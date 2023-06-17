@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Abusing HTTP hop-by-hop request headers - Nathan Davison</title>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="generator" content="GravCMS" />
+    <meta name="description" content="nathandavison.com" />
+  <link rel="shortcut icon" href="/user/themes/cacti/images/favicon.ico" />
+  <link rel="alternate" type="application/rss+xml" title="My Blog" href="/rss.xml">
+
+          
+      <link href="/user/themes/cacti/css/style.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/form/assets/form-styles.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/youtube/css/youtube.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/highlight/css/vs2015.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/featherlight/css/featherlight.min.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/login/css/login.css" type="text/css" rel="stylesheet">
+    
+  </head>
+<body>
+
+    <section id="navigation">
+
+    <nav class="main-nav">
+                                <a class="active" href="/">
+                <span class="arrow">←</span>                                 Blog
+            </a>
+                                <a class="" href="/contact">
+                                                contact
+            </a>
+                    </nav>
+    </section>
+
+    <section id="wrapper">
+                            
+        <div class="">
+            <article class="post">
+        <header>
+            <h1>Abusing HTTP hop-by-hop request headers</h1>
+            <h2 class="headline">October 31, 2019</h2>
+        </header>
+        <section id="post-body">
+            <p>In this writeup, I will be covering techniques which can be used to influence web systems and applications in unexpected ways, by abusing HTTP/1.1 hop-by-hop headers. Systems affected by these techniques are likely ones with multiple caches/proxies handling requests before reaching the backend application.</p>
+<h2>What is a hop-by-hop header?</h2>
+<p>A hop-by-hop header is a header which is designed to be processed and consumed by the proxy currently handling the request, as opposed to an end-to-end header, which is designed to be present in the request all the way through to the end of the request. According to <a href="https://tools.ietf.org/html/rfc2616#section-13.5.1">RFC 2612</a>, the HTTP/1.1 spec treats the following headers as hop-by-hop by default: <code>Keep-Alive</code>, <code>Transfer-Encoding</code>, <code>TE</code>, <code>Connection</code>, <code>Trailer</code>, <code>Upgrade</code>, <code>Proxy-Authorization</code> and <code>Proxy-Authenticate</code>. When encountering these headers in a request, a compliant proxy should process or action whatever it is these headers are indicating, and not forward them on to the next hop.</p>
+<p>Further to these defaults, a request <a href="https://tools.ietf.org/html/rfc2616#section-14.10">may also define a custom set of headers to be treated as hop-by-hop</a> by adding them to the <code>Connection</code> header, like so:</p>
+<pre><code class="language-http">Connection: close, X-Foo, X-Bar</code></pre>
+<p>In this example, we're asking the proxy to treat <code>X-Foo</code> and <code>X-Bar</code> as hop-by-hop, meaning we want a proxy to remove them from the request before passing the request on. This HTTP/1.1 ability to define custom hop-by-hop headers is key to the techniques and findings in this writeup.</p>
+<h2>The theory on abusing hop-by-hop headers</h2>
+<p>The act of removing a header from a HTTP request is not necessarily going to cause issues, however being able to remove headers that were not in the original request but were added by either the frontend or another proxy in the chain could create unpredictable results. It's basically like turning off a switch - it could do nothing at all, or it could be catastophic.</p>
+<p>For example, perhaps a header is added somewhere in the chain which instructs the backend of an access control decision or of the fact the request came from an Internet user, and its absence in the request triggers a logic change in the application. Perhaps application logic is assuming a header will be present because a proxy unconditionally adds the header, and dumps out juicy debug error information when it is not there. It is the act of a frontend proxy forwarding the hop-by-hop header list that can create issues, as any header it adds to the request may be up for removal by the next hop, and each time a hop in the chain forwards the hop-by-hop list instead of consuming the headers, the opportunity for impact is increased.</p>
+<p>You may have noticed that the <code>Connection</code> header itself is listed above as a default hop-by-hop header. This would suggest a compliant proxy should not be forwarding a request's list of custom hop-by-hop headers to the next server in the chain in its <code>Connection</code> header when it forwards the request - that is, a compliant proxy should consume the requests' <code>Connection</code> header entirely. However, my research suggests this may not always be occurring as expected - some systems appear to either also forward the entire <code>Connection</code> header, or copy the hop-by-hop list and append it to its own <code>Connection</code> header. For example, HAProxy appears to pass the <code>Connection</code> header through untouched, as does Nginx when acting as a proxy.</p>
+<p>The following graphic shows how abusing hop-by-hop headers may create issues, if the backend is expecting <code>X-Important-Header</code> and incorporates its presence in a logical decision:</p>
+<p><a rel="lightbox" href="/user/pages/01.blog/abusing-http-hop-by-hop-request-headers/hbh-theory-diagram.PNG"><img alt="" src="/user/pages/01.blog/abusing-http-hop-by-hop-request-headers/hbh-theory-diagram.PNG" /></a></p>
+<p>I will be covering some examples of abusing hop-by-hop headers causing affects in web applications that I have encountered below as well as some ideas on where impact could be found, but the potential outcomes are going to be very specific to the application and infrastructure being targeted, and the header(s) being targeted and what they mean to the backend.</p>
+<h2>Testing for hop-by-hop header abuse potential</h2>
+<p>Before we get in to real world examples, it may be handy to know if a system may be vulnerable to some sort of hop-by-hop header abuse before diving in too deep. Luckily, this is pretty quick to test - identify a request header that creates a noticeable difference in the response when it is and isn't present, and see what happens when it's added as a hop-by-hop header. If the system is removing the header, then the response when the header is in both the request and listed in the <code>Connection</code> header should be the same as when it isn't present in the request at all, but different to when it is present in the request and not listed as a hop-by-hop header.</p>
+<p>A quick and easy test is the <code>Cookie</code> header, against an endpoint which requires authentication (assuming the target system uses cookie auth). Take for instance the following request:</p>
+<pre><code class="language-http">GET /api/me HTTP/1.1
+Host: foo.bar
+Cookie: session=xxx
+Connection: close, Cookie
+</code></pre>
+<p>If we say that <code>/api/me</code> is supposed to return a HTTP 200 with user details when the request is authenticated, and <code>session=xxx</code> is a valid authenticated cookie session value, then the above request may return something other than the anticipated response if the system is allowing hop-by-hop headers defined in the original request to modify which headers get sent to the backend.</p>
+<p>In this example, the <code>Cookie</code> header was provided in the original request, so a proxy is not doing anything wrong by removing it before sending the request onwards, and as such this test is only a very basic indication that a proxy (either the frontend or another in the chain) is respecting our custom hop-by-hop headers list and actioning its removal - it doesn't confirm our custom hop-by-hop list is being forwarded along the chain to another proxy, which is where things get more interesting (and is what I'll refer to as "forwarded hop-by-hop" from here on out). To test for this, you'll likely need to employ the help of a tool like Burp's Intruder, or the following script I wrote (which also tests for cache poisoning, covered below):</p>
+<p><a href="https://gist.github.com/ndavison/298d11b3a77b97c908d63a345d3c624d">https://gist.github.com/ndavison/298d11b3a77b97c908d63a345d3c624d</a></p>
+<p>If you pass in a list of known headers, such as <a href="https://github.com/danielmiessler/SecLists/blob/master/Discovery/Web-Content/BurpSuite-ParamMiner/lowercase-headers">this one</a>, you can observe which headers are causing effects despite not being in your original request:</p>
+<pre><code class="language-bash">for HEADER in $(cat headers.txt); do python poison-test.py -u "https://target" -x "$HEADER"; sleep 1; done</code></pre>
+<p>This will cycle through the entire header list and print out if its presence in the hop-by-hop list created a different status code or response body size. If its presence caused a different response and the header wasn't in your original request (in my script's case, very few are), you may have found an issue worth exploring, as this suggests the hop-by-hop list is being forwarded at least one hop.</p>
+<p>So now the general theory and testing are covered, let's move in to some use cases where this technique may useful.</p>
+<h2>Masking the originating IP address by hiding X-Forwarded-For</h2>
+<p>When a frontend proxy accepts a user request, it may add the IP address of this user to the <code>X-Forwarded-For</code> (XFF) header, so infrastructure and apps in the backend can know the IP address of the requesting user. However, by instructing proxies that this header is hop-by-hop, we may end up removing this header from the request, and the backend app will either never receive it, or it will receive an IP address value that is not of the original user, but of a server elsewhere in the chain.</p>
+<p>For example, gorouter in CloudFoundry <a href="https://github.com/cloudfoundry/gorouter/blob/3bf551bf37e6105ac6c689fd5390d57ec4ea8c55/proxy/handler/request_handler.go#L249-L259">will set the IP address of the device before it as the XFF header value if the header isn't already present in the request</a>, before it forwards the request to the backend app. So if the device before gorouter forwards the requests' hop-by-hop list and this list contains <code>X-Forwarded-For</code>, gorouter will strip out <code>X-Forwarded-For</code> and it will then set <code>X-Forwarded-For</code> to whatever the previous device's IP address is and forward that to the backend app, effectively cleaning the header of the IP address of the original requestor, at least as far as the backend app can tell.</p>
+<p>Other than disguising originating IP from some components of a system's infrastructure, this technique may offer a way to influence authentication or access control decisions. Imagine an application behind a load balancer that then forwards to a proxy that finally forwards to the app. When encountering a request originating from a local IP range (e.g. <code>10.1.2.0/24</code>), this app treats the request as trusted in some way, perhaps granting unfettered access to <code>/admin</code>. Because it is behind a reliable proxy, the app may trust that, even if an attacker attempts a traditional <code>X-Forwarded-For</code> spoof, the load balancer will still append the real originating IP to the header, such that it looks like <code>&lt;attacker spoofed ip&gt;, &lt;real attacker ip&gt;</code>, so the app can safely handle spoof attempts. However, if the XFF header is being stripped out before reaching the app, which may be the case if an attacker adds XFF as a hop-by-hop header, then a proxy (like gorouter) will react to the absence of <code>X-Forwarded-For</code> by taking the IP address of the load balancer before it as the requesting IP (e.g. <code>10.1.2.3</code>), and the final <code>X-Forwarded-For</code> value to reach the application will be <code>10.1.2.3</code>, with nothing else appended. In such an application, this request would grant access to <code>/admin</code> because that's a local address.</p>
+<p>Another thing to keep in mind is XFF is only one header used for passing on the real IP address of a user - depending on the system being targeted, you may also have <code>Forwarded</code>, <code>X-Real-IP</code>, and a bunch of others that are less common.</p>
+<h2>Fingerprinting services</h2>
+<p>Using the technique to find forwarded hop-by-hop headers as outlined in the testing instructions above, one could potentially gather more information about a system based on the headers that, when removed from a request due to this technique, causes an error or an otherwise noticeable difference. Obviously, the more specific a header is to a particular technology or stack, the more telling having it trigger this sort of outcome may be - removing <code>X-Forwarded-Proto</code> causing an issue is perhaps less informative than if something like <code>X-BLUECOAT-VIA</code> does as well, for instance.</p>
+<p>If it appears as if the frontend itself is erroring due to disliking your attempt to add a blacklisted hop-by-hop (which you may be able to conclude based on how quickly the response is coming back to you, relative to the target system's response times for other errors, cached hits etc), then this itself could be useful - whether the error is generated by a fault in the system or because the frontend system is hardened for just this technique doesn't really matter for the purpose of information gathering. For example, setting headers like <code>Age</code>, <code>Host</code>, <code>X-Forwarded-For</code>, <code>Server</code> and a fair few other common ones as hop-by-hop returns a very simple 0 body length <code>HTTP/1.1 400 Bad Request</code> from Varnish, which may be an alternative way to detect such a cache if it was otherwise not tipping its presence in response headers etc. </p>
+<h2>Cache poisoning DoS</h2>
+<p>This one is more theory than practice as I haven't encountered a real world example when testing against systems in scope for bug bounty programs, but the impact here is very similar to the outcomes covered in <a href="https://cpdos.org/">this cache poisoning DoS research</a>, and the <a href="https://portswigger.net/research/responsible-denial-of-service-with-web-cache-poisoning">Responsible denial of service with web cache poisoning research</a> on PortSwigger, however the technique is slightly different - rather than directly using or modifying request headers which create an undesired application state that poisons web caches, we're abusing hop-by-hop headers to create the undesired application state, by removing a header which the application relies on to function normally, in this case a header added to the request by a proxy.</p>
+<p>For this to be exploitable, what we'd need to happen is: a system's frontend cache forwards the hop-by-hop header list instead of consuming it, an intermediate proxy processes the hop-by-hop list and removes a header either it, another proxy further in the chain, or the backend app requires, and the act of removing such a header results in an undesirable response such as a HTTP 400 or 501 being returned by something after the web cache. Like the above research covers, this might result in the web cache in front of the app choosing to accept this undesirable response as the copy to serve other users, and hence we have cache poisoning denial of service.</p>
+<p>While I have not yet found a real world instance of cache poisoning DoS using hop-by-hop header abuse, I have encountered a Varnish configuration which allows hop-by-hop forwarding. By default Varnish appears to consume the <code>Connection</code> header in a request and doesn't add it to the backend request, however the official repo suggests the following config for Websocket support:</p>
+<pre><code>sub vcl_recv {
+    if (req.http.upgrade ~ "(?i)websocket") {
+        return (pipe);
+    }
+}
+
+sub vcl_pipe {
+    if (req.http.upgrade) {
+        set bereq.http.upgrade = req.http.upgrade;
+        set bereq.http.connection = req.http.connection;
+    }
+}</code></pre>
+<p>This is found at <a href="https://github.com/varnishcache/varnish-cache/blob/78c243894bed86b3c0637fda49d47f3d33fc72b0/doc/sphinx/users-guide/vcl-example-websockets.rst">https://github.com/varnishcache/varnish-cache/blob/78c243894bed86b3c0637fda49d47f3d33fc72b0/doc/sphinx/users-guide/vcl-example-websockets.rst</a>.</p>
+<p>What this config is doing is sending any <code>Upgrade: websocket</code> request into the <code>vcl_pipe</code> subroutine, which according to the official docs means "Varnish stops inspecting each request and just shuffles bytes to the backend". Once a request is inside the pipe routine, this config will reflect the request's <code>Connection</code> header into the backend request's <code>Connection</code> header, meaing we've achieved hop-by-hop forwarding to the backend, albeit with the <code>Upgrade: websocket</code> header in the request also. However, we can just send something like <code>Upgrade: websocketz</code> to try and prevent the backend from actually treating the connection as a websocket, which will probably be considered invalid by the backend and ignored, but passes the <code>if (req.http.upgrade ~ "(?i)websocket")</code> condition in the above config and triggers the pipe behavior.</p>
+<p>The following request was tested against Varnish 6.3 with the above Websocket config:</p>
+<pre><code class="language-http">GET / HTTP/1.1
+Host: foo.bar
+Upgrade: websocketz
+Connection: keep-alive, xxx</code></pre>
+<p>And this is what Varnish sent to the backend:</p>
+<pre><code class="language-http">GET / HTTP/1.1
+Host: foo.bar
+X-Forwarded-For: 192.168.176.1
+xxx: yyy
+X-Varnish: 11
+upgrade: websocketz
+connection: keep-alive, xxx</code></pre>
+<p>And here's the relevant raw Varnish log:</p>
+<pre><code>        24 Begin          b bereq 23 pipe
+        24 BereqMethod    b GET
+        24 BereqURL       b /
+        24 BereqProtocol  b HTTP/1.1
+        24 BereqHeader    b Host: foo.bar
+        24 BereqHeader    b Connection: keep-alive, xxx
+        24 BereqHeader    b X-Forwarded-For: 192.168.176.1
+        24 BereqHeader    b xxx: yyy
+        24 BereqHeader    b X-Varnish: 23
+        24 BereqUnset     b Connection: keep-alive, xxx
+        24 BereqHeader    b Connection: close
+        24 VCL_call       b PIPE
+        24 BereqHeader    b upgrade: websocketz
+        24 BereqUnset     b Connection: close
+        24 BereqHeader    b connection: keep-alive, xxx
+        24 VCL_return     b pipe</code></pre>
+<p>FYI, the <code>xxx</code> header was added in the Varnish config's <code>vcl_recv</code> routine, i.e. <code>set req.http.xxx = "yyy";</code>. When a backend receives this request, if it actions hop-by-hop header removals, then we should see that <code>xxx</code> is gone.</p>
+<p>My understanding of Varnish's pipe mode means there is no cache in play here, so this is unlikely to offer any cache poisoning DoS potential, however setups with this config may at least continue to offer a way to abuse hop-by-hop headers despite being behind an otherwise robust cache layer like Varnish.</p>
+<p>So, what would it take to make Varnish vulnerable to a form of cache poisoning DoS via hop-by-hop header abuse? I eventually came to the following config, which forwards the request's hop-by-hop headers and should also be compatible with caching:</p>
+<pre><code>vcl 4.0;
+import var;
+
+backend default {
+  .host = "foo.bar";
+  .port = "80";
+}
+
+sub vcl_recv {
+    set req.http.xxx = "yyy";
+    var.global_set("conn_string", req.http.connection);
+}
+
+sub vcl_backend_fetch {
+    set bereq.http.connection = var.global_get("conn_string");
+}</code></pre>
+<p>This requires the variables VMOD extension for Varnish to be installed. What this is doing is creating a global var out of the request <code>Connection</code> header, and applying it to the backend request. This is similar to the above Websocket config, but this pattern does not prevent caching. I have no idea why anyone would want to legitimately copy the <code>Connection</code> value from the user request to the backend request like this, but if they did and backend app is sensitive to the removal of the <code>xxx</code> header as used in this example, it could result in cache poisoning DoS.</p>
+<p>For a demo of cache poisoning DoS using this config, see the following:</p>
+<div class="grav-youtube-wrapper ">
+  <div class="grav-youtube">
+      <iframe src="https://www.youtube-nocookie.com/embed/x2P46ae8JCg?rel=0&showinfo=1" frameborder="0" allowfullscreen></iframe>
+  </div>
+</div>
+<p>The <code>xxx</code> header added by Varnish is expected by the app, and without it errors with a (cacheable) 404. The full setup used was: Varnish 6.3 (using the above config) in front of Apache HTTPD (I couldn't get nginx to remove the headers in the hop-by-hop list) which uses <code>ProxyPass</code> to a Flask app running on gunicorn.</p>
+<h2>In server-side requests (by design or forged)</h2>
+<p>This one is a little out there, but bear with me. Some systems give users the ability to define requests that will be performed by the server side, such as when adding webhooks or similar. While it isn't normal for these to include the ability to define the connection's hop-by-hop header list directly, if you're able to add custom headers, you could try adding a <code>Connection</code> header and seeing if it is accepted along with your hop-by-hop headers.</p>
+<p>Otherwise, if you have an exploitable SSRF vulnerability in a system, adding this technique could reveal more information or help make the SSRF more impactful. You would likely need the ability to inject headers along with the SSRF though, which is fairly rare.</p>
+<p>This one isn't really a different type of impact, but more of a different launching point for the same uses already covered - that is, modifying the request coming from the target's systems rather than your client.</p>
+<h2>WAF rule bypass</h2>
+<p>If a system has a WAF rule which requires the presence of a header in the request, then this may be bypassed using hop-by-hop. In this case, the WAF would presumably have to not strip the hop-by-hop headers itself - otherwise it may do so before inspecting the request for conformance, which likely wouldn't bypass the rule check. If the WAF does happen to ignore the <code>Connection</code> hop-by-hop list and, better still, forwards it to the next hop, then you should be able to include the header in the request to pass the WAF rule, but also have the header listed as a hop-by-hop, so the next proxy strips it out, effectively sending a request through to the backend without the header.</p>
+<h2>Further research needed</h2>
+<p>It feels like there is more here to discover, in regards to common headers that are able to be abused by this technique more reliably than, say, a custom header, and other uses and impacts the technique may offer. It may also be useful to test various proxies and caches to see how vulnerable they are to this, and whether there is config that may make them vulnerable if they're not out of the box - as outlined above, my testing suggests HAProxy and Nginx (configured as a proxy) will forward the hop-by-hop list, where as Apache HTTPD does not, and Varnish doesn't unless you really go out of your way to configure it to do so, however my research didn't drill down into changes across versions and common configuration patterns. I also didn't do much in the way of testing popular caching/proxy services like Cloudflare, Cloudfront etc, although quick tests suggests they are not forwarding hop-by-hop lists.</p>
+        </section>
+    </article>
+    <footer id="post-meta" class="clearfix">
+        <a href="http://twitter.com/nj_dav">
+            <img class="avatar" src="/user/themes/cacti/images/avatar.png">
+            <div>
+                <span class="dark">Nathan Davison</span>
+                <span>Blogging about web security stuff</span>
+            </div>
+        </a>
+
+        <section id="sharing">
+            <a class="twitter" href="https://twitter.com/intent/tweet?text=Abusing HTTP hop-by-hop request headers by @nj_dav - http://localhost/blog/abusing-http-hop-by-hop-request-headers"><span class="icon-twitter"> Tweet</span></a>
+<a class="facebook" href="#" onclick="
+    window.open(
+      'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(location.href),
+      'facebook-share-dialog',
+      'width=626,height=436');
+    return false;"><span class="icon-facebook-rect"> Share</span>
+</a>
+        </section>
+    </footer>
+
+    <nav id="post-nav" class="clearfix">
+                <span class="prev">
+            <a href="/blog/exploiting-email-address-parsing-with-aws-ses"><span class="arrow">←</span> Exploiting email address parsing with AWS SES</a>
+        </span>
+        
+                <span class="next">
+            <a href="/blog/haproxy-http-request-smuggling">HAProxy HTTP request smuggling (CVE-2019-18277) <span class="arrow">→</span></a>
+        </span>
+            </nav>
+
+
+    <!-- Disqus comments -->
+    
+    <!-- Archive post list -->
+    
+            </div>
+
+                <footer id="footer">
+    <p class="small">© Copyright 2023</p>
+</footer>
+            </section>
+
+        
+                      
+      <script src="/assets/ab993aa8955cc9b4d8ab5a20cb172675.js"></script>
+<script>
+hljs.initHighlightingOnLoad();
+</script>
+<script>
+$(document).ready(function(){
+    $('a[rel="lightbox"]').featherlight({
+        openSpeed: 250,
+        closeSpeed: 250,
+        closeOnClick: 'background',
+        closeOnEsc: '1',
+        root: 'body'
+    });
+});
+</script>
+
+    
+  </body>
+</html>

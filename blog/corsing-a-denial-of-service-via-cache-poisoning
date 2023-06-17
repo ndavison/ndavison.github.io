@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>CORS&#039;ing a Denial of Service via cache poisoning - Nathan Davison</title>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="generator" content="GravCMS" />
+    <meta name="description" content="nathandavison.com" />
+  <link rel="shortcut icon" href="/user/themes/cacti/images/favicon.ico" />
+  <link rel="alternate" type="application/rss+xml" title="My Blog" href="/rss.xml">
+
+          
+      <link href="/user/themes/cacti/css/style.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/form/assets/form-styles.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/youtube/css/youtube.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/highlight/css/vs2015.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/featherlight/css/featherlight.min.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/login/css/login.css" type="text/css" rel="stylesheet">
+    
+  </head>
+<body>
+
+    <section id="navigation">
+
+    <nav class="main-nav">
+                                <a class="active" href="/">
+                <span class="arrow">←</span>                                 Blog
+            </a>
+                                <a class="" href="/contact">
+                                                contact
+            </a>
+                    </nav>
+    </section>
+
+    <section id="wrapper">
+                            
+        <div class="">
+            <article class="post">
+        <header>
+            <h1>CORS'ing a Denial of Service via cache poisoning</h1>
+            <h2 class="headline">March 09, 2019</h2>
+        </header>
+        <section id="post-body">
+            <p>Since reading <a href="https://portswigger.net/blog/practical-web-cache-poisoning">Practical Cache Poisoning by James Kettle</a>, testing the misconfiguration of web caching layers for cache poisoning and other related vulnerabilities has become a standard go-to of mine when spending time on bug bounties or other pentesting activities. Recently, while doing some bounty work, I came across a potential impact of cache poisoning I hadn't seen before - one that left the Cross-Origin Resource Sharing (CORS) mechanism in browsers vulnerable to being abused by an attacker that could lead to a Denial of Service of the website being attacked. Unfortunately the asset in question was out of scope for the owner's bounty program because the site was hosted by a Wordpress-as-a-service provider, however it turns out this issue was more widespread than just the site I found it on, and possibly extended to many more websites hosted by the provider.</p>
+<p>As a quick primer, <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS">CORS</a> allows web resources to bypass the browser Same-origin policy in a controlled manner. Basically, it allows the Javascript on one site (e.g. ABC.com) to request an endpoint on another (e.g. XYZ.com) via fetch or XMLHttpRequest and read the response, if the resource being requested specifically allows it. I have <a href="https://nathandavison.com/blog/be-careful-with-authenticated-cors-and-secrets-like-csrf-tokens">previously posted about being careful not to configure CORS so sensitive data can be leaked</a>, however CORS misconfiguration can also lead to denying access by abusing the access control mechanisms it provides. Take the following request, for instance:</p>
+<p><a rel="lightbox" href="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-1.png"><img alt="" src="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-1.png" /></a></p>
+<p>This condensed request is not very special - we're just requesting a <a href="https://v2.wp-api.org/">WP-JSON API</a> resource with a <code>Origin</code> value of <code>https://foo.bar</code>, which is just a dummy value to serve as an example of a different origin compared to the Wordpress site being requested. What does the response look like?</p>
+<p><a rel="lightbox" href="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-2.png"><img alt="" src="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-2.png" /></a></p>
+<p>This is where things get a bit more interesting. As shown, our <code>Origin</code> value is now being reflected back in the <code>Access-Control-Allow-Origin</code> response header, which is the header that instructs the browser on whether the requesting origin is allowed to read the response. Given it is unlikely that <code>https://foo.bar</code> is specifically being white listed, it is safe to assume this means the response is just echoing back whatever <code>Origin</code> value is in the request. This echoing back is a rather common practice by web devs when trying to open up a resource to all origins, however it is not a good idea to do so without careful consideration, and in this case it will prove key to being able to abuse the CORS system.</p>
+<p>Other than the fact this echoing-back can be dangerous when the <code>Access-Control-Allow-Credentials</code> header is also being returned as <code>true</code> as outlined in <a href="https://nathandavison.com/blog/be-careful-with-authenticated-cors-and-secrets-like-csrf-tokens">my other CORS related post</a> (although it appears WP-JSON may not be vulnerable due to <a href="https://developer.wordpress.org/rest-api/using-the-rest-api/authentication/">requiring a valid nonce</a> on all authenticated requests), this response hints at another problem - namely, the <code>Cache-Control: max-age=600, must-revalidate</code> in the response hints at the fact that this is a cacheable response. If there was some sort of intermediate web cache involved in this request, it may just cache it and serve future requests for this resource from cache. What happens if we request the same resource again, but this time change the <code>Origin</code> value in the request?</p>
+<p><a rel="lightbox" href="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-3.png"><img alt="" src="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-3.png" /></a></p>
+<p>And the response:</p>
+<p><a rel="lightbox" href="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-4.png"><img alt="" src="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-4.png" /></a></p>
+<p>We can see the response was indeed likely served from cache, as indicated by the <code>X-Cache: HIT: 1</code> response header. This is where we can see the cache poisoning take effect. Despite the fact the <code>Origin</code> value was changed in the request, the response continues to <em>only</em> allow <code>https://foo.bar</code> read access to this resource in a CORS context. This is a classic case of cache poisoning as a result of something in the request being used in the response, but not being used in the cache key.</p>
+<p>How does this lead to a denial of service? Well, consider the possibility that this Wordpress site is the backend of a "headless" or "decoupled" CMS style web app. In this approach, popular CMS' like Wordpress are used as content stores and content publishing interfaces, while custom frontends unrestricted by the CMS' theming engine are used as the presentation layer to the user, and communication between the two is often achieved via some sort of API and frontend Javascript framework pairing. What I have been requesting above is one such API, and it turns out Wordpress has had this REST-like JSON API (called WP-JSON API) inbuilt into its core package since v4.7, so you could say out-of-the-box Wordpress is ready to be used as a headless CMS.</p>
+<p>If by some chance the frontend of the app in question happens to sit in a different origin than the Wordpress site (e.g. <code>www.site.com</code> for the frontend and <code>api.site.com</code> for the Wordpress instance), then the frontend would require CORS to be configured to allow it access to WP-JSON API, and this cache poisoning vulnerability could impact the availability of such an app, as the mismatch between a legitimate <code>Origin</code> value in a request compared to the attacker's poisoned <code>Access-Control-Allow-Origin</code> value in the response will result in an error like the following in a browser console:</p>
+<p><a rel="lightbox" href="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-5.png"><img alt="" src="/user/pages/01.blog/corsing-a-denial-of-service-via-cache-poisoning/cors-cache-poisoning-blog-5.png" /></a></p>
+<p>This request should have worked, because we've already demonstrated that the backend is just echoing back the <code>Origin</code> in the <code>Access-Control-Allow-Origin</code> header, but what actually happened is this response was served from cache and the <code>Access-Control-Allow-Origin</code> value was poisoned by an earlier request. This of course would be the same if the Wordpress site wasn't being used in a headless config, but rather had other services on other origins that required access to the WP-JSON API, such as for content sharing purposes. Basically, this cache poisoning would affect any situation where WP-JSON and CORS are needed.</p>
+<p>After reporting the issue, the Wordpress SaaS provider recently applied a fix that prevents requests with an <code>Origin</code> header from being served from cache.</p>
+<p>Update 16/04/20: While it's not the report that originally inspired this write up, a <a href="https://hackerone.com/reports/591302">similar report I submitted to Automattic for wordpress.com</a> has been disclosed.</p>
+        </section>
+    </article>
+    <footer id="post-meta" class="clearfix">
+        <a href="http://twitter.com/nj_dav">
+            <img class="avatar" src="/user/themes/cacti/images/avatar.png">
+            <div>
+                <span class="dark">Nathan Davison</span>
+                <span>Blogging about web security stuff</span>
+            </div>
+        </a>
+
+        <section id="sharing">
+            <a class="twitter" href="https://twitter.com/intent/tweet?text=CORS'ing a Denial of Service via cache poisoning by @nj_dav - http://localhost/blog/corsing-a-denial-of-service-via-cache-poisoning"><span class="icon-twitter"> Tweet</span></a>
+<a class="facebook" href="#" onclick="
+    window.open(
+      'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(location.href),
+      'facebook-share-dialog',
+      'width=626,height=436');
+    return false;"><span class="icon-facebook-rect"> Share</span>
+</a>
+        </section>
+    </footer>
+
+    <nav id="post-nav" class="clearfix">
+                <span class="prev">
+            <a href="/blog/haproxy-http-request-smuggling"><span class="arrow">←</span> HAProxy HTTP request smuggling (CVE-2019-18277)</a>
+        </span>
+        
+            </nav>
+
+
+    <!-- Disqus comments -->
+    
+    <!-- Archive post list -->
+    
+            </div>
+
+                <footer id="footer">
+    <p class="small">© Copyright 2023</p>
+</footer>
+            </section>
+
+        
+                      
+      <script src="/assets/ab993aa8955cc9b4d8ab5a20cb172675.js"></script>
+<script>
+hljs.initHighlightingOnLoad();
+</script>
+<script>
+$(document).ready(function(){
+    $('a[rel="lightbox"]').featherlight({
+        openSpeed: 250,
+        closeSpeed: 250,
+        closeOnClick: 'background',
+        closeOnEsc: '1',
+        root: 'body'
+    });
+});
+</script>
+
+    
+  </body>
+</html>

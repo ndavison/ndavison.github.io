@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Cache poisoning DoS in CloudFoundry gorouter (CVE-2020-5401) - Nathan Davison</title>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="generator" content="GravCMS" />
+    <meta name="description" content="nathandavison.com" />
+    <meta name="cve" content="CVE-2020-5401" />
+  <link rel="shortcut icon" href="/user/themes/cacti/images/favicon.ico" />
+  <link rel="alternate" type="application/rss+xml" title="My Blog" href="/rss.xml">
+
+          
+      <link href="/user/themes/cacti/css/style.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/form/assets/form-styles.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/youtube/css/youtube.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/highlight/css/vs2015.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/featherlight/css/featherlight.min.css" type="text/css" rel="stylesheet">
+<link href="/user/plugins/login/css/login.css" type="text/css" rel="stylesheet">
+    
+  </head>
+<body>
+
+    <section id="navigation">
+
+    <nav class="main-nav">
+                                <a class="active" href="/">
+                <span class="arrow">←</span>                                 Blog
+            </a>
+                                <a class="" href="/contact">
+                                                contact
+            </a>
+                    </nav>
+    </section>
+
+    <section id="wrapper">
+                            
+        <div class="">
+            <article class="post">
+        <header>
+            <h1>Cache poisoning DoS in CloudFoundry gorouter (CVE-2020-5401)</h1>
+            <h2 class="headline">February 25, 2020</h2>
+        </header>
+        <section id="post-body">
+            <p>I first touched on the technique of cache poisoning causing a Denial of Service just over a year ago when I published <a href="https://nathandavison.com/blog/corsing-a-denial-of-service-via-cache-poisoning">CORS'ing a Denial of Service via cache poisoning</a>, which details a technique that would allow an attacker to poison the <code>Access-Control-Allow-Origin</code> header value in cached API responses, meaning any genuine CORS request to the resource would be denied. Not long after, this type of vulnerability gained more traction with the different (and more impacting) techniques outlined in the excellent <a href="https://cpdos.org/">CPDoS.org</a> research.</p>
+<p>This time around, I'm detailing a similar issue, but with an even more refined scope than CPDoS via CORS - this issue affected the CloudFoundry platform, a now VMWare owned cloud offering for developing web apps with APIs that abstract the underlying infrastructure (such as AWS or GCP). More specifically, it affected the gorouter package - the component responsible for directing web requests to specific CloudFoundry app instances.</p>
+<p>To achieve CPDoS, one must find a way to cause an undesirable response that ends up in a front end cache and served to other users. Typically, a cache won't allow this to happen if the technique used to cause the undesirable response relies on some input provided in a standard or anticipated way, such as in the query string, or in common HTTP headers - such input would be used by the cache to generate the key for the cached copy, and only other requests with the same input would receive the cached response back. However, cloud systems often provide advanced users and sys admins with extra abilities via custom HTTP headers, such as added diagnostic information or control over routing, which is where the CPDoS vulnerability for CloudFoundry could be found - in its custom <code>X-CF-APP-INSTANCE</code> request header.</p>
+<p>This header <a href="https://docs.cloudfoundry.org/concepts/http-routing.html#-http-headers-for-app-instance-routing">allows the requester to target a specific app and instance</a> with the format of <code>APP-GUID:INSTANCE-NUMBER</code>, such as <code>X-CF-APP-INSTANCE: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1</code>. If the guid is a valid value held by a running app, and the instance number is pointing to a valid running instance, then the request will be served by that instance. However, if you feed in a bad value (like the example just given with all the <code>a</code>'s), you would get a response back like:</p>
+<pre><code class="language-http">HTTP/1.1 404 Not Found
+Date: Tue, 25 Feb 2020 07:32:28 GMT
+Content-Type: text/plain; charset=utf-8
+Cache-Control: public, max-age=3600
+Vary: Accept-Encoding
+X-Cf-Routererror: unknown_route
+</code></pre>
+<p>The problem with this response is we are given back a HTTP 404 error, which is <a href="https://tools.ietf.org/html/rfc7231#section-6.5.4">cacheable by default according to the RFC</a>, and in fact will be cached by default when using common web cache frontends like Cloudflare and CloudFront. The <code>Cache-Control: public, max-age=3600</code> only seems to compound the issue, although my testing on CloudFront seemed to indicate that this was not critical for the 404 error to be cached.</p>
+<p>As I originally found this issue on an asset in a public bug bounty program (not yet disclosed), I sought to maximize the impact of the vulnerability and demonstrate how this could allow me to cause widespread DoS with only a handful of requests. This asset was behind CloudFront, which means we can use a resource like <a href="https://www.nexcess.net/web-tools/dns-checker/">https://www.nexcess.net/web-tools/dns-checker/</a> to first collect the IP addresses of the target's edge caches, and then for each edge cache, run a script like the following:</p>
+<pre><code class="language-bash">#!/bin/bash
+
+while true
+do
+    printf 'GET /?cb=xxx HTTP/1.1\r\n'\
+'Host: TARGET_HOST\r\n'\
+'X-CF-APP-INSTANCE: xxx:1\r\n'\
+'Connection: close\r\n'\
+'\r\n'\
+    | openssl s_client -ign_eof -connect IP_OF_EDGE_CACHE:443 -servername TARGET_HOST
+    sleep 10
+done</code></pre>
+<p>This will poison the cache for the resource <code>https://TARGET_HOST/?cb=xxx</code>, where the edge cache IP and the target hostname would be placed in the raw HTTP request and <code>openssl</code> command arguments where relevant. This script issues the poisoning every 10 seconds, to ensure the DoS is maintained. Depending on which IPs you target, you can control which CloudFront regions are poisoned. In this example I've used what's called a cache buster - the <code>?cb=xxx</code> in the query string. Because I confirmed before hand that the query string is used in the cache key, I knew it would be safe to attack this target using the cache buster without affecting real traffic - only those also requesting with the same query string would be affected. Of course, a real attacker won't be this courteous, but this technique is important when testing bounty program assets for issues like CPDoS, as you don't want to affect real users/customers.</p>
+<p>In this particular instance, a specific header with a specific type of value created an error response when targeting a specific cloud platform, which was cacheable and likely would have been cached by most conforming web caching layers. The result of this is cache poisoning DoS - the error you raised can and will be served to other users, effectively blocking their access to the target. While it is unlikely this specific header will have a similar effect anywhere outside of CloudFoundry, I wouldn't be surprised if similar CPDoS issues are present in other cloud providers. In this case, the fix could be found in multiple places - you could configure the caching layer to no longer cache 404 errors, or you could make sure the <code>X-CF-APP-INSTANCE</code> header is used in determining the cache key. Or, the cloud provider could instead return a non-cacheable response, which is what Pivotal did in fixing this vulnerability in the gorouter component, <a href="https://github.com/cloudfoundry/gorouter/commit/02af2cad0eef9966a118bdb4d24819f658e48c36">opting instead for a HTTP 400 response</a> (which, as the CPDoS.org research outlined, may still be cached, but only if the caching layer is poorly configured).</p>
+<p>This issue was allocated CVE-2020-5401 and <a href="https://www.cloudfoundry.org/blog/cve-2020-5401/">fixed in a recent release of the CloudFoundry gorouter package</a>.</p>
+<p><strong>Update 13/03</strong>: The <a href="https://hackerone.com/reports/728664">original bounty report</a> regarding this vulnerability has been disclosed.</p>
+        </section>
+    </article>
+    <footer id="post-meta" class="clearfix">
+        <a href="http://twitter.com/nj_dav">
+            <img class="avatar" src="/user/themes/cacti/images/avatar.png">
+            <div>
+                <span class="dark">Nathan Davison</span>
+                <span>Blogging about web security stuff</span>
+            </div>
+        </a>
+
+        <section id="sharing">
+            <a class="twitter" href="https://twitter.com/intent/tweet?text=Cache poisoning DoS in CloudFoundry gorouter (CVE-2020-5401) by @nj_dav - http://localhost/blog/cache-poisoning-dos-in-cloudfoundry-gorouter"><span class="icon-twitter"> Tweet</span></a>
+<a class="facebook" href="#" onclick="
+    window.open(
+      'https://www.facebook.com/sharer/sharer.php?u='+encodeURIComponent(location.href),
+      'facebook-share-dialog',
+      'width=626,height=436');
+    return false;"><span class="icon-facebook-rect"> Share</span>
+</a>
+        </section>
+    </footer>
+
+    <nav id="post-nav" class="clearfix">
+                <span class="prev">
+            <a href="/blog/shaking-secrets-out-of-circleci-builds"><span class="arrow">←</span> Shaking secrets out of CircleCI builds - insecure configuration and the threat of malicious pull requests</a>
+        </span>
+        
+                <span class="next">
+            <a href="/blog/exploiting-email-address-parsing-with-aws-ses">Exploiting email address parsing with AWS SES <span class="arrow">→</span></a>
+        </span>
+            </nav>
+
+
+    <!-- Disqus comments -->
+    
+    <!-- Archive post list -->
+    
+            </div>
+
+                <footer id="footer">
+    <p class="small">© Copyright 2023</p>
+</footer>
+            </section>
+
+        
+                      
+      <script src="/assets/ab993aa8955cc9b4d8ab5a20cb172675.js"></script>
+<script>
+hljs.initHighlightingOnLoad();
+</script>
+<script>
+$(document).ready(function(){
+    $('a[rel="lightbox"]').featherlight({
+        openSpeed: 250,
+        closeSpeed: 250,
+        closeOnClick: 'background',
+        closeOnEsc: '1',
+        root: 'body'
+    });
+});
+</script>
+
+    
+  </body>
+</html>
